@@ -68,6 +68,11 @@ Agrega estas variables al servicio (además de las que ya tenías):
 | `MAX_CONCURRENT_JOBS` | Trabajos PDF simultáneos (automático: entre `2` y `6`) |
 | `DOWNLOAD_WORKERS` | Descargas de Drive simultáneas por trabajo (automático: entre `2` y `8`; `1` = como antes) |
 | `MAX_CONCURRENT_TOMOS` | Tomos simultáneos (automático: `2` con 4 GB o más; si no, `1`) |
+| `CARATULAS_WORKERS` | Carátulas PDF simultáneas por lote (automático: entre `2` y `8`) |
+| `CARATULAS_SLIDES_POR_MINUTO` | Ediciones de Slides por minuto (por defecto `55`; Google permite unas 60 por usuario) |
+| `COMPILAR_CON_QPDF` | `1` = une compilados con qpdf, fuera de Python (por defecto). `0` = usa pypdf, como antes |
+| `TOMOS_SOURCE_GROUP_SIZE` | PDF unidos por operación en tomos (`8` con más de 1,2 GB; si no, `2`) |
+| `TOMOS_MERGE_WORKERS` | Uniones simultáneas por tomo (hasta `3` con más de 1,2 GB; si no, `1`) |
 | `GUNICORN_THREADS` | Hilos para atender consultas (por defecto `8`) |
 | `UPLOAD_CHUNK_SIZE` | Tamaño de chunk en bytes para I/O de Drive (por defecto 4 MiB) |
 | `GC_COLLECT_EVERY_FILES` | GC forzado cada N PDFs (por defecto `20`) |
