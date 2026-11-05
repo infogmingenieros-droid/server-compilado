@@ -185,25 +185,19 @@ class Lote:
             conocida = self.carpetas.get(clave)
             if conocida:
                 return conocida
-            base = (f"'{_literal(padre)}' in parents and name = '{_literal(nombre)}' "
-                    f"and mimeType = '{MIME_CARPETA}'")
-            halladas = self.buscar(base + " and trashed = false")
+            # Lo que está en la papelera no se recupera: traería los PDF viejos
+            # y no se generaría nada nuevo.
+            halladas = self.buscar(
+                f"'{_literal(padre)}' in parents and name = '{_literal(nombre)}' "
+                f"and mimeType = '{MIME_CARPETA}' and trashed = false"
+            )
             if halladas:
                 identificador = halladas[0]["id"]
             else:
-                # Igual que Apps Script: una carpeta en la papelera se recupera.
-                en_papelera = self.buscar(base + " and trashed = true")
-                if en_papelera:
-                    identificador = en_papelera[0]["id"]
-                    self.drive().files().update(
-                        fileId=identificador, body={"trashed": False}, fields="id",
-                        supportsAllDrives=True,
-                    ).execute(num_retries=REINTENTOS)
-                else:
-                    identificador = self.drive().files().create(
-                        body={"name": nombre, "mimeType": MIME_CARPETA, "parents": [padre]},
-                        fields="id", supportsAllDrives=True,
-                    ).execute(num_retries=REINTENTOS)["id"]
+                identificador = self.drive().files().create(
+                    body={"name": nombre, "mimeType": MIME_CARPETA, "parents": [padre]},
+                    fields="id", supportsAllDrives=True,
+                ).execute(num_retries=REINTENTOS)["id"]
             self.carpetas[clave] = identificador
             return identificador
 
