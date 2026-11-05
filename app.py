@@ -26,6 +26,8 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from pypdf import PdfReader, PdfWriter
 import fitz  # PyMuPDF: ruta especial para PDFs gigantes, sin alterar el flujo normal
 
+import caratulas_rapidas
+
 # ================================================================
 # CONFIGURACIÓN GENERAL (OPTIMIZADA PARA RAILWAY / HASTA 8 GB RAM)
 # ================================================================
@@ -70,6 +72,10 @@ PORT = int(os.getenv("PORT", "8080"))
 MAX_CONCURRENT_JOBS = max(1, _env_int("MAX_CONCURRENT_JOBS", max(2, min(6, RECURSOS_CPU, RECURSOS_RAM_MB // 700))))
 # Descargas simultáneas de Drive por trabajo. 1 = de una en una, como antes.
 DOWNLOAD_WORKERS = max(1, _env_int("DOWNLOAD_WORKERS", max(2, min(8, RECURSOS_CPU * 2))))
+# Carátulas PDF simultáneas por lote. Esperan a Google, casi no usan CPU.
+CARATULAS_WORKERS = max(1, _env_int("CARATULAS_WORKERS", max(2, min(8, RECURSOS_CPU * 2))))
+# qpdf corre fuera de Python, así varios compilados usan varios núcleos a la vez.
+COMPILAR_CON_QPDF = _env_int("COMPILAR_CON_QPDF", 1) == 1
 UPLOAD_CHUNK_SIZE = max(256 * 1024, int(os.getenv("UPLOAD_CHUNK_SIZE", str(4 * 1024 * 1024))))
 JOB_TTL_SECONDS = max(60, int(os.getenv("JOB_TTL_SECONDS", str(6 * 60 * 60))))
 GC_COLLECT_EVERY_FILES = max(5, int(os.getenv("GC_COLLECT_EVERY_FILES", "20")))
@@ -473,7 +479,7 @@ def create_or_reuse_job(*, job_type: str, request_id: str, token: str, payload: 
             "updated_at": time.time(),
             "progress": {
                 "processed_files": 0,
-                "total_files": len(payload.get("file_ids") or []),
+                "total_files": len(payload.get("file_ids") or payload.get("items") or []),
                 "parts_created": 0,
                 "pages_in_current_part": 0,
                 "stage": "queued",
@@ -702,12 +708,12 @@ def compile_in_parts_heavy_qpdf(
     output_filename: str, page_limit: int,
     progress_callback: ProgressCallback | None = None,
     replace_existing: bool = False, strict_mode: bool = True,
-    expected_source_count: int = 0,
+    expected_source_count: int = 0, token: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """PDFs gigantes: qpdf como proceso externo; no se cargan páginas en Python.
+    """Une con qpdf como proceso externo; no se cargan páginas en Python.
 
-    Descarga a disco con la función existente y conserva el orden y la división
-    por límite de páginas. No modifica el flujo normal ni las rutas HTTP.
+    Descarga a disco y conserva el orden y la división por límite de páginas.
+    Con token, descarga varias fuentes a la vez.
     """
     qpdf_bin = shutil.which("qpdf")
     if not qpdf_bin:
@@ -753,7 +759,9 @@ def compile_in_parts_heavy_qpdf(
 
         before = memory_snapshot()
         operation = "fusionar" if "--pages" in args else "contar_paginas"
-        app.logger.warning(
+        # Contar se repite por cada PDF: solo se registra si algo sale mal.
+        diagnostico = app.logger.warning if operation == "fusionar" else app.logger.debug
+        diagnostico(
             "DIAG QPDF INICIO operacion=%s; memoria_y_disco=%s",
             operation, before,
         )
@@ -775,7 +783,7 @@ def compile_in_parts_heavy_qpdf(
         after_events = after.get("memory.events", {})
         oom_delta = int(after_events.get("oom", 0)) - int(before_events.get("oom", 0))
         killed_delta = int(after_events.get("oom_kill", 0)) - int(before_events.get("oom_kill", 0))
-        app.logger.warning(
+        diagnostico(
             "DIAG QPDF FIN operacion=%s rc=%s segundos=%.1f oom_delta=%s "
             "oom_kill_delta=%s; antes=%s; despues=%s",
             operation, result.returncode, time.monotonic() - started,
@@ -882,61 +890,64 @@ def compile_in_parts_heavy_qpdf(
 
     try:
         with tempfile.TemporaryDirectory(prefix="maestro_qpdf_pesado_") as temp_dir:
-            for index, file_id in enumerate(file_ids, start=1):
-                source_path = None
-                try:
-                    source_path = download_drive_file_to_path(service, str(file_id), temp_dir)
-                    num_pages = page_count(source_path)
-                    next_page = 1
-                    while next_page <= num_pages:
-                        available = page_limit - pages_in_current_part
-                        if available <= 0:
-                            flush_current(temp_dir, preserve_path=source_path, is_split=True)
-                            available = page_limit
-                        end_page = min(num_pages, next_page + available - 1)
-                        segments.append((source_path, next_page, end_page))
-                        pages_in_current_part += end_page - next_page + 1
-                        next_page = end_page + 1
-                        if pages_in_current_part == page_limit:
-                            keep = source_path if next_page <= num_pages else None
-                            flush_current(temp_dir, preserve_path=keep, is_split=True)
+            with contextlib.closing(iter_descargas(service, token, file_ids, temp_dir)) as descargas:
+                for index, file_id in enumerate(file_ids, start=1):
+                    source_path = None
+                    try:
+                        source_path, error_descarga = next(descargas)
+                        if error_descarga:
+                            raise error_descarga
+                        num_pages = page_count(source_path)
+                        next_page = 1
+                        while next_page <= num_pages:
+                            available = page_limit - pages_in_current_part
+                            if available <= 0:
+                                flush_current(temp_dir, preserve_path=source_path, is_split=True)
+                                available = page_limit
+                            end_page = min(num_pages, next_page + available - 1)
+                            segments.append((source_path, next_page, end_page))
+                            pages_in_current_part += end_page - next_page + 1
+                            next_page = end_page + 1
+                            if pages_in_current_part == page_limit:
+                                keep = source_path if next_page <= num_pages else None
+                                flush_current(temp_dir, preserve_path=keep, is_split=True)
 
-                    # Si el último segmento ya se subió, no hace falta
-                    # conservar esta fuente hasta el final del trabajo.
-                    if source_path and not any(seg[0] == source_path for seg in segments):
-                        if os.path.exists(source_path):
-                            os.remove(source_path)
-
-                    report(
-                        processed_files=index, total_files=len(file_ids),
-                        parts_created=len(parts),
-                        pages_in_current_part=pages_in_current_part,
-                        current_file_id=str(file_id),
-                        processing_mode="heavy_qpdf",
-                    )
-                except Exception as exc:
-                    # Un error al construir/subir una parte no permite ignorar
-                    # sólo una fuente sin arriesgar un PDF incompleto.
-                    # Fallar y revertir es preferible a reportar éxito parcial.
-                    if segments or parts:
-                        raise
-                    errors.append({"file_id": str(file_id), "detail": str(exc)})
-                    report(
-                        processed_files=index, total_files=len(file_ids),
-                        parts_created=len(parts),
-                        pages_in_current_part=pages_in_current_part,
-                        current_file_id=str(file_id), last_error=str(exc),
-                        processing_mode="heavy_qpdf",
-                    )
-                    if strict_mode:
-                        return [], errors
-                finally:
-                    if source_path and not any(seg[0] == source_path for seg in segments):
-                        try:
+                        # Si el último segmento ya se subió, no hace falta
+                        # conservar esta fuente hasta el final del trabajo.
+                        if source_path and not any(seg[0] == source_path for seg in segments):
                             if os.path.exists(source_path):
                                 os.remove(source_path)
-                        except OSError:
-                            pass
+
+                        report(
+                            processed_files=index, total_files=len(file_ids),
+                            parts_created=len(parts),
+                            pages_in_current_part=pages_in_current_part,
+                            current_file_id=str(file_id),
+                            processing_mode="heavy_qpdf",
+                        )
+                    except Exception as exc:
+                        # Un error al construir/subir una parte no permite ignorar
+                        # sólo una fuente sin arriesgar un PDF incompleto.
+                        # Fallar y revertir es preferible a reportar éxito parcial.
+                        if segments or parts:
+                            raise
+                        errors.append({"file_id": str(file_id), "detail": str(exc)})
+                        report(
+                            processed_files=index, total_files=len(file_ids),
+                            parts_created=len(parts),
+                            pages_in_current_part=pages_in_current_part,
+                            current_file_id=str(file_id), last_error=str(exc),
+                            processing_mode="heavy_qpdf",
+                        )
+                        if strict_mode:
+                            return [], errors
+                    finally:
+                        if source_path and not any(seg[0] == source_path for seg in segments):
+                            try:
+                                if os.path.exists(source_path):
+                                    os.remove(source_path)
+                            except OSError:
+                                pass
             flush_current(temp_dir, is_split=bool(parts))
             return parts, errors
     except Exception:
@@ -973,6 +984,24 @@ def compile_in_parts(
         raise ValueError("El límite de páginas debe ser mayor que cero.")
     if expected_source_count and len(file_ids) != expected_source_count:
         raise ValueError("La cantidad de fuentes recibidas no coincide con la esperada.")
+
+    # qpdf une fuera de Python: varios compilados usan varios núcleos y no
+    # cargan páginas en memoria. Si no puede, sigue el camino de siempre.
+    if COMPILAR_CON_QPDF and token and shutil.which("qpdf"):
+        try:
+            partes_qpdf, errores_qpdf = compile_in_parts_heavy_qpdf(
+                service=service, file_ids=file_ids,
+                destination_folder_id=destination_folder_id,
+                output_filename=output_filename, page_limit=page_limit,
+                progress_callback=progress_callback,
+                replace_existing=replace_existing, strict_mode=strict_mode,
+                expected_source_count=expected_source_count, token=token,
+            )
+            if partes_qpdf or not errores_qpdf:
+                return partes_qpdf, errores_qpdf
+            app.logger.warning("qpdf no pudo compilar; se usa pypdf: %s", errores_qpdf[-1].get("detail"))
+        except Exception as exc_qpdf:
+            app.logger.warning("qpdf no pudo compilar; se usa pypdf: %s", exc_qpdf)
 
     # Detectar PDF gigante sin descargarlo. Si aparece uno, usamos la ruta
     # especial de bajo consumo de RAM. El flujo normal queda intacto.
@@ -1105,7 +1134,10 @@ TOMOS_TOTAL_BUDGET_MB = min(int(_TOMOS_RAM_MB * 0.8) if _TOMOS_ESCALA else 900,
 TOMOS_MIN_FREE_MB = max(100, int(os.getenv("TOMOS_MIN_FREE_MB", "150")))
 TOMOS_MAX_SECONDS = max(60, int(os.getenv("TOMOS_MAX_SECONDS", "2400")))
 TOMOS_DISK_RESERVE_MB = max(64, int(os.getenv("TOMOS_DISK_RESERVE_MB", "160")))
-TOMOS_SOURCE_GROUP_SIZE = 2  # Fusión jerárquica: dos entradas consecutivas por operación.
+# Fusión jerárquica: entradas consecutivas por operación. Con más memoria se unen
+# de 8 en 8: hay menos niveles y el mismo contenido se reescribe menos veces.
+TOMOS_SOURCE_GROUP_SIZE = max(2, _env_int("TOMOS_SOURCE_GROUP_SIZE", 8 if _TOMOS_ESCALA else 2))
+TOMOS_MERGE_WORKERS = max(1, _env_int("TOMOS_MERGE_WORKERS", min(3, RECURSOS_CPU) if _TOMOS_ESCALA else 1))
 
 
 def _tomo_rss_mb(pid: int) -> float | None:
@@ -1171,6 +1203,9 @@ def _tomo_run_pdf(command: list[str], stage: str,
                                 text=True, start_new_session=True)
         peak_rss = 0.0
         latest_diagnostic = {}
+        # Revisa seguido al inicio: contar páginas tarda milisegundos y esperar
+        # 0,25 s fijos por cada PDF sumaba minutos en un tomo grande.
+        pausa = 0.01
         def stop():
             if proc.poll() is not None:
                 return
@@ -1218,7 +1253,8 @@ def _tomo_run_pdf(command: list[str], stage: str,
                 if time.monotonic() - start > timeout:
                     stop()
                     raise RuntimeError(f"TIEMPO_AGOTADO: {stage}, más de {timeout} segundos.")
-                time.sleep(.25)
+                time.sleep(pausa)
+                pausa = min(.25, pausa * 1.5)
         finally:
             stop()
         stdout.seek(0); stderr.seek(0)
@@ -1397,12 +1433,13 @@ def assemble_tomo(
             level = 0
             while len(pending) > 1:
                 level += 1
-                next_level: list[str] = []
                 groups = [pending[i:i + TOMOS_SOURCE_GROUP_SIZE]
                           for i in range(0, len(pending), TOMOS_SOURCE_GROUP_SIZE)]
-                for group_number, group in enumerate(groups, 1):
+
+                def fusionar_bloque(group_number: int, group: list[str]) -> str:
+                    nonlocal stage, current_file_id
                     if len(group) == 1:
-                        next_level.append(group[0]); continue
+                        return group[0]
                     stage = "merging"
                     block_ids = [fid for input_path in group for fid in ids_by_path[input_path]]
                     current_file_id = block_ids[0]
@@ -1427,7 +1464,6 @@ def assemble_tomo(
                     report(stage=stage, merge_step=block_stage, merge_engine=motor_usado,
                            processed_files=total_files, total_files=total_files,
                            diagnostics=tomos_diagnostics())
-                    next_level.append(output)
                     pages_by_path[output] = actual_pages
                     ids_by_path[output] = block_ids
                     for consumed in group:
@@ -1437,7 +1473,11 @@ def assemble_tomo(
                         pages_by_path.pop(consumed, None)
                         ids_by_path.pop(consumed, None)
                     _tomo_require_disk(temp_dir)
-                pending = next_level
+                    return output
+
+                # Los bloques de un nivel no dependen entre sí; map conserva el orden.
+                with ThreadPoolExecutor(max_workers=TOMOS_MERGE_WORKERS, thread_name_prefix="tomo-merge") as pool:
+                    pending = list(pool.map(fusionar_bloque, range(1, len(groups) + 1), groups))
             final_path = pending[0]
             stage = "validating"
             final_pages = _tomo_pdf_count(final_path)
@@ -1502,6 +1542,11 @@ def run_background_job(job_id: str, job_type: str, token: str, payload: dict[str
                 final_status = "partial" if errors else "success"
                 update_job(job_id, job_state="finished", status=final_status,
                            result={"status": final_status, "message": "Compilación terminada.", "partes": parts, "errores": errors})
+                return
+
+            if job_type == "caratulas":
+                resultado = caratulas_rapidas.generar_lote(token, payload, CARATULAS_WORKERS, progress_callback)
+                update_job(job_id, job_state="finished", status=resultado["status"], result=resultado)
                 return
 
             if job_type == "tomos":
@@ -1570,6 +1615,9 @@ def health():
         active_jobs = sum(1 for job in jobs.values() if job.get("job_state") in {"queued", "running"})
     return jsonify({"status": "ok", "service": "sistema-maestro-pdf", "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
                     "download_workers": DOWNLOAD_WORKERS, "max_concurrent_tomos": MAX_CONCURRENT_TOMOS,
+                    "caratulas_rapidas": True, "caratulas_workers": CARATULAS_WORKERS,
+                    "compilar_con_qpdf": COMPILAR_CON_QPDF and bool(shutil.which("qpdf")),
+                    "tomos_grupo": TOMOS_SOURCE_GROUP_SIZE, "tomos_merge_workers": TOMOS_MERGE_WORKERS,
                     "recursos_ram_mb": RECURSOS_RAM_MB, "recursos_cpu": RECURSOS_CPU,
                     "tomos_max_rss_mb": TOMOS_MAX_RSS_MB,
                     "active_jobs": active_jobs, "server_instance_id": SERVER_INSTANCE_ID,
@@ -1591,6 +1639,25 @@ def consultar_trabajo(job_id: str):
         return jsonify({"status": "error", "detail": str(exc)}), 400
     except Exception as exc:
         app.logger.exception("Error consultando trabajo %s", job_id)
+        return jsonify({"status": "error", "detail": str(exc)}), 500
+
+
+@app.post("/caratulas/lote")
+def caratulas_lote():
+    """Genera un lote de carátulas PDF en segundo plano; se consulta en /trabajos/<id>."""
+    try:
+        data = validate_payload(request.get_json(silent=True), ["items", "plantilla_id", "destino_raiz_id"])
+        token = get_bearer_token()
+        if not isinstance(data["items"], list) or len(data["items"]) > caratulas_rapidas.MAX_ITEMS_POR_LOTE:
+            raise ValueError(f"Envía entre 1 y {caratulas_rapidas.MAX_ITEMS_POR_LOTE} carátulas por lote.")
+        request_id = str(data.get("request_id") or uuid.uuid4().hex).strip()
+        job_id, created = create_or_reuse_job(job_type="caratulas", request_id=request_id, token=token, payload=data)
+        return jsonify({"status": "accepted", "job_state": "queued", "job_id": job_id, "request_id": request_id,
+                        "reused": not created, "poll_url": f"/trabajos/{job_id}", "message": "Lote recibido."}), 202
+    except ValueError as exc:
+        return jsonify({"status": "error", "detail": str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception("Error crítico en /caratulas/lote")
         return jsonify({"status": "error", "detail": str(exc)}), 500
 
 
