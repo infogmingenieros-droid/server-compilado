@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import errno
 import traceback
@@ -29,8 +30,46 @@ import fitz  # PyMuPDF: ruta especial para PDFs gigantes, sin alterar el flujo n
 # CONFIGURACIÓN GENERAL (OPTIMIZADA PARA RAILWAY / HASTA 8 GB RAM)
 # ================================================================
 
+def _detectar_ram_mb() -> int | None:
+    try:
+        with open("/sys/fs/cgroup/memory.max", "r", encoding="ascii") as handle:
+            raw = handle.read().strip()
+        if raw.isdigit() and int(raw) < (1 << 60):
+            return int(raw) // 1048576
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _detectar_cpu() -> int | None:
+    try:
+        with open("/sys/fs/cgroup/cpu.max", "r", encoding="ascii") as handle:
+            cuota, periodo = handle.read().split()[:2]
+        if cuota != "max":
+            return max(1, int(int(cuota) / int(periodo)))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _env_int(nombre: str, predeterminado: int) -> int:
+    try:
+        return int(os.getenv(nombre, "") or predeterminado)
+    except ValueError:
+        return predeterminado
+
+
+# Capacidad que el servidor puede usar. RECURSOS_RAM_MB y RECURSOS_CPU (en
+# Railway → Variables) mandan; si no están, se usa el límite real del contenedor;
+# si tampoco se conoce, los valores conservadores de siempre (1 GB y 2 CPU).
+RECURSOS_RAM_MB = max(512, _env_int("RECURSOS_RAM_MB", _detectar_ram_mb() or 1024))
+RECURSOS_CPU = max(1, _env_int("RECURSOS_CPU", _detectar_cpu() or 2))
+
 PORT = int(os.getenv("PORT", "8080"))
-MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
+# Un trabajo de compilación usa ~700 MB en el peor caso normal.
+MAX_CONCURRENT_JOBS = max(1, _env_int("MAX_CONCURRENT_JOBS", max(2, min(6, RECURSOS_CPU, RECURSOS_RAM_MB // 700))))
+# Descargas simultáneas de Drive por trabajo. 1 = de una en una, como antes.
+DOWNLOAD_WORKERS = max(1, _env_int("DOWNLOAD_WORKERS", max(2, min(8, RECURSOS_CPU * 2))))
 UPLOAD_CHUNK_SIZE = max(256 * 1024, int(os.getenv("UPLOAD_CHUNK_SIZE", str(4 * 1024 * 1024))))
 JOB_TTL_SECONDS = max(60, int(os.getenv("JOB_TTL_SECONDS", str(6 * 60 * 60))))
 GC_COLLECT_EVERY_FILES = max(5, int(os.getenv("GC_COLLECT_EVERY_FILES", "20")))
@@ -53,8 +92,9 @@ app.config.update(
 )
 
 job_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
-# TOMOS se serializan entre sí; el compilador conserva sus 2 workers originales.
-tomos_semaphore = threading.BoundedSemaphore(1)
+# TOMOS: uno a la vez salvo que haya memoria de sobra (cada motor tiene su límite).
+MAX_CONCURRENT_TOMOS = max(1, _env_int("MAX_CONCURRENT_TOMOS", 2 if RECURSOS_RAM_MB >= 4096 else 1))
+tomos_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TOMOS)
 job_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS, thread_name_prefix="pdf-job")
 jobs_lock = threading.RLock()
 jobs: dict[str, dict[str, Any]] = {}
@@ -101,6 +141,52 @@ def download_drive_file_to_path(service, file_id: str, directory: str) -> str:
         while not done:
             _, done = downloader.next_chunk(num_retries=5)
     return path
+
+
+_drive_local = threading.local()
+
+
+def _drive_service_de_hilo(token: str):
+    # El cliente de Google no es seguro entre hilos: uno propio por hilo.
+    if getattr(_drive_local, "token", None) != token:
+        _drive_local.service = get_drive_service(token)
+        _drive_local.token = token
+    return _drive_local.service
+
+
+def iter_descargas(service, token: str, file_ids: list[str], directory: str):
+    """Entrega (ruta, error) de cada archivo EN EL ORDEN recibido.
+
+    Descarga por adelantado una ventana corta en paralelo. El orden del PDF final
+    no cambia y el disco se mantiene acotado. Sin token o con DOWNLOAD_WORKERS=1
+    descarga de una en una, igual que antes.
+    """
+    if not token or DOWNLOAD_WORKERS <= 1 or len(file_ids) <= 1:
+        for file_id in file_ids:
+            try:
+                yield download_drive_file_to_path(service, str(file_id), directory), None
+            except Exception as exc:
+                yield None, exc
+        return
+
+    def descargar(file_id: str) -> str:
+        return download_drive_file_to_path(_drive_service_de_hilo(token), str(file_id), directory)
+
+    ventana = DOWNLOAD_WORKERS * 2
+    pool = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS, thread_name_prefix="drive-dl")
+    futuros: dict[int, Any] = {}
+    try:
+        for indice in range(len(file_ids)):
+            for siguiente in range(indice, min(indice + ventana, len(file_ids))):
+                if siguiente not in futuros:
+                    futuros[siguiente] = pool.submit(descargar, file_ids[siguiente])
+            try:
+                yield futuros.pop(indice).result(), None
+            except Exception as exc:
+                yield None, exc
+    finally:
+        # Espera a los hilos antes de que se borre la carpeta temporal.
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def open_pdf_reader_path(path: str, file_id: str) -> tuple[Any, PdfReader]:
@@ -858,12 +944,30 @@ def compile_in_parts_heavy_qpdf(
             trash_file_ids(service, [p.get("id", "") for p in parts])
         raise
 
+def _tamanos_drive(service, token: str, file_ids: list[str]) -> list[tuple[str, int, str] | None]:
+    """Tamaño y nombre de cada fuente, en paralelo y sin descargarlas."""
+    def consultar(file_id: str):
+        try:
+            cliente = _drive_service_de_hilo(token) if token else service
+            tamano, nombre = get_drive_pdf_size(cliente, str(file_id))
+            return str(file_id), tamano, nombre
+        except Exception as _meta_exc:
+            # Si Drive no entrega el tamaño, no rompemos el comportamiento actual.
+            app.logger.warning("No se pudo leer tamaño de %s: %s", file_id, _meta_exc)
+            return None
+
+    if not token or DOWNLOAD_WORKERS <= 1:
+        return [consultar(file_id) for file_id in file_ids]
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS, thread_name_prefix="drive-meta") as pool:
+        return list(pool.map(consultar, file_ids))
+
+
 def compile_in_parts(
     service, file_ids: list[str], destination_folder_id: str,
     output_filename: str, page_limit: int,
     progress_callback: ProgressCallback | None = None,
     replace_existing: bool = False, strict_mode: bool = True,
-    expected_source_count: int = 0,
+    expected_source_count: int = 0, token: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     if page_limit < 1:
         raise ValueError("El límite de páginas debe ser mayor que cero.")
@@ -872,15 +976,8 @@ def compile_in_parts(
 
     # Detectar PDF gigante sin descargarlo. Si aparece uno, usamos la ruta
     # especial de bajo consumo de RAM. El flujo normal queda intacto.
-    heavy_sources: list[tuple[str, int, str]] = []
-    for _file_id in file_ids:
-        try:
-            _size, _name = get_drive_pdf_size(service, str(_file_id))
-            if _size >= HEAVY_PDF_THRESHOLD_BYTES:
-                heavy_sources.append((str(_file_id), _size, _name))
-        except Exception as _meta_exc:
-            # Si Drive no entrega el tamaño, no rompemos el comportamiento actual.
-            app.logger.warning("No se pudo leer tamaño de %s: %s", _file_id, _meta_exc)
+    heavy_sources = [info for info in _tamanos_drive(service, token, file_ids)
+                     if info and info[1] >= HEAVY_PDF_THRESHOLD_BYTES]
 
     if heavy_sources:
         app.logger.warning(
@@ -947,57 +1044,64 @@ def compile_in_parts(
             gc.collect()
 
         total_files = len(file_ids)
-        for index, file_id in enumerate(file_ids, start=1):
-            source_handle = None
-            source_path = None
-            try:
-                source_path = download_drive_file_to_path(service, str(file_id), temp_dir)
-                source_handle, reader = open_pdf_reader_path(source_path, str(file_id))
+        with contextlib.closing(iter_descargas(service, token, file_ids, temp_dir)) as descargas:
+            for index, file_id in enumerate(file_ids, start=1):
+                source_handle = None
+                source_path = None
+                try:
+                    source_path, error_descarga = next(descargas)
+                    if error_descarga:
+                        raise error_descarga
+                    source_handle, reader = open_pdf_reader_path(source_path, str(file_id))
 
-                for page in reader.pages:
-                    if pages_in_current_part >= page_limit:
-                        flush_current(is_split=True)
-                    writer.add_page(page)
-                    pages_in_current_part += 1
+                    for page in reader.pages:
+                        if pages_in_current_part >= page_limit:
+                            flush_current(is_split=True)
+                        writer.add_page(page)
+                        pages_in_current_part += 1
 
-                report(processed_files=index, total_files=total_files, parts_created=len(parts),
-                       pages_in_current_part=pages_in_current_part, current_file_id=str(file_id))
-            except Exception as exc:
-                errors.append({"file_id": str(file_id), "detail": str(exc)})
-                report(processed_files=index, total_files=total_files, parts_created=len(parts),
-                       pages_in_current_part=pages_in_current_part, current_file_id=str(file_id), last_error=str(exc))
-                if strict_mode:
-                    trash_file_ids(service, [p.get("id", "") for p in parts])
-                    return [], errors
-            finally:
-                if source_handle:
-                    try:
-                        source_handle.close()
-                    except Exception:
-                        pass
-                if source_path and os.path.exists(source_path):
-                    try:
-                        os.remove(source_path)
-                    except Exception:
-                        pass
+                    report(processed_files=index, total_files=total_files, parts_created=len(parts),
+                           pages_in_current_part=pages_in_current_part, current_file_id=str(file_id))
+                except Exception as exc:
+                    errors.append({"file_id": str(file_id), "detail": str(exc)})
+                    report(processed_files=index, total_files=total_files, parts_created=len(parts),
+                           pages_in_current_part=pages_in_current_part, current_file_id=str(file_id), last_error=str(exc))
+                    if strict_mode:
+                        trash_file_ids(service, [p.get("id", "") for p in parts])
+                        return [], errors
+                finally:
+                    if source_handle:
+                        try:
+                            source_handle.close()
+                        except Exception:
+                            pass
+                    if source_path and os.path.exists(source_path):
+                        try:
+                            os.remove(source_path)
+                        except Exception:
+                            pass
 
-            # Forzar GC solo por lotes. Los objetos temporales del lector ya no
-            # necesitan una recolección completa después de cada archivo.
-            if index % GC_COLLECT_EVERY_FILES == 0:
-                gc.collect()
+                # Forzar GC solo por lotes. Los objetos temporales del lector ya no
+                # necesitan una recolección completa después de cada archivo.
+                if index % GC_COLLECT_EVERY_FILES == 0:
+                    gc.collect()
 
         flush_current(is_split=bool(parts))
         return parts, errors
 
 
 
-# Solo TOMOS: motor aislado en un subproceso, con presupuesto apropiado para 1 GB.
-# El compilador existente conserva su código y sus dos workers configurados.
-# Railway 1 GB: el motor puede llegar a ~700 MB en PDFs difíciles, pero
-# mantenemos barreras globales para no tumbar el worker de Gunicorn.
-TOMOS_MAX_RSS_MB = min(760, max(128, int(os.getenv("TOMOS_MAX_RSS_MB", "720"))))
-TOMOS_MAX_AS_MB = min(900, max(256, int(os.getenv("TOMOS_MAX_AS_MB", "850"))))
-TOMOS_TOTAL_BUDGET_MB = min(900, max(300, int(os.getenv("TOMOS_TOTAL_BUDGET_MB", "850"))))
+# Solo TOMOS: motor aislado en un subproceso. Con 1 GB conserva exactamente los
+# límites de siempre; con más memoria disponible los amplía en proporción.
+# Mantenemos barreras globales para no tumbar el worker de Gunicorn.
+_TOMOS_RAM_MB = min(RECURSOS_RAM_MB, 8192)
+_TOMOS_ESCALA = _TOMOS_RAM_MB > 1200
+TOMOS_MAX_RSS_MB = min(int(_TOMOS_RAM_MB * 0.6) if _TOMOS_ESCALA else 760,
+                       max(128, _env_int("TOMOS_MAX_RSS_MB", int(_TOMOS_RAM_MB * 0.6) if _TOMOS_ESCALA else 720)))
+TOMOS_MAX_AS_MB = min(int(_TOMOS_RAM_MB * 0.75) if _TOMOS_ESCALA else 900,
+                      max(256, _env_int("TOMOS_MAX_AS_MB", int(_TOMOS_RAM_MB * 0.75) if _TOMOS_ESCALA else 850)))
+TOMOS_TOTAL_BUDGET_MB = min(int(_TOMOS_RAM_MB * 0.8) if _TOMOS_ESCALA else 900,
+                            max(300, _env_int("TOMOS_TOTAL_BUDGET_MB", int(_TOMOS_RAM_MB * 0.8) if _TOMOS_ESCALA else 850)))
 TOMOS_MIN_FREE_MB = max(100, int(os.getenv("TOMOS_MIN_FREE_MB", "150")))
 TOMOS_MAX_SECONDS = max(60, int(os.getenv("TOMOS_MAX_SECONDS", "2400")))
 TOMOS_DISK_RESERVE_MB = max(64, int(os.getenv("TOMOS_DISK_RESERVE_MB", "160")))
@@ -1239,7 +1343,7 @@ def assemble_tomo(
     service, source_ids: list[str], destination_folder_id: str,
     output_filename: str, progress_callback: ProgressCallback | None = None,
     replace_existing: bool = False, strict_mode: bool = True,
-    expected_pages: int = 0, expected_source_count: int = 0,
+    expected_pages: int = 0, expected_source_count: int = 0, token: str = "",
 ) -> tuple[dict[str, Any] | None, int, list[dict[str, Any]]]:
     """TOMOS exclusivamente: descarga a disco, une con mutool, verifica y sube.
 
@@ -1266,23 +1370,26 @@ def assemble_tomo(
             pending: list[str] = []
             pages_by_path: dict[str, int] = {}
             ids_by_path: dict[str, list[str]] = {}
-            for index, file_id in enumerate(source_ids, 1):
-                current_file_id = str(file_id)
-                stage = "downloading"
-                _tomo_require_disk(temp_dir)
-                report(stage=stage, processed_files=index - 1, total_files=total_files,
-                       current_file_id=current_file_id, diagnostics=tomos_diagnostics())
-                path = download_drive_file_to_path(service, current_file_id, temp_dir)
-                stage = "reading"
-                _tomo_require_disk(temp_dir)
-                pages = _tomo_pdf_count(path)
-                total_pages += pages
-                pages_by_path[path] = pages
-                ids_by_path[path] = [current_file_id]
-                pending.append(path)
-                report(stage=stage, processed_files=index, total_files=total_files,
-                       current_file_id=current_file_id, pages_in_current_part=total_pages,
-                       diagnostics=tomos_diagnostics())
+            with contextlib.closing(iter_descargas(service, token, source_ids, temp_dir)) as descargas:
+                for index, file_id in enumerate(source_ids, 1):
+                    current_file_id = str(file_id)
+                    stage = "downloading"
+                    _tomo_require_disk(temp_dir)
+                    report(stage=stage, processed_files=index - 1, total_files=total_files,
+                           current_file_id=current_file_id, diagnostics=tomos_diagnostics())
+                    path, error_descarga = next(descargas)
+                    if error_descarga:
+                        raise error_descarga
+                    stage = "reading"
+                    _tomo_require_disk(temp_dir)
+                    pages = _tomo_pdf_count(path)
+                    total_pages += pages
+                    pages_by_path[path] = pages
+                    ids_by_path[path] = [current_file_id]
+                    pending.append(path)
+                    report(stage=stage, processed_files=index, total_files=total_files,
+                           current_file_id=current_file_id, pages_in_current_part=total_pages,
+                           diagnostics=tomos_diagnostics())
             if expected_pages and total_pages != expected_pages:
                 raise RuntimeError(f"INTEGRIDAD_PDF: se esperaban {expected_pages} páginas y "
                                    f"las fuentes suman {total_pages}. No se subió nada.")
@@ -1383,6 +1490,7 @@ def run_background_job(job_id: str, job_type: str, token: str, payload: dict[str
                     replace_existing=as_bool(payload.get("replace_existing")),
                     strict_mode=as_bool(payload.get("strict_mode", True)),
                     expected_source_count=int(payload.get("expected_source_count") or 0),
+                    token=token,
                 )
 
                 if not parts:
@@ -1413,6 +1521,7 @@ def run_background_job(job_id: str, job_type: str, token: str, payload: dict[str
                         strict_mode=as_bool(payload.get("strict_mode", True)),
                         expected_pages=int(payload.get("expected_pages") or 0),
                         expected_source_count=int(payload.get("expected_source_count") or 0),
+                        token=token,
                     )
 
                 if not uploaded:
@@ -1460,6 +1569,9 @@ def health():
     with jobs_lock:
         active_jobs = sum(1 for job in jobs.values() if job.get("job_state") in {"queued", "running"})
     return jsonify({"status": "ok", "service": "sistema-maestro-pdf", "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+                    "download_workers": DOWNLOAD_WORKERS, "max_concurrent_tomos": MAX_CONCURRENT_TOMOS,
+                    "recursos_ram_mb": RECURSOS_RAM_MB, "recursos_cpu": RECURSOS_CPU,
+                    "tomos_max_rss_mb": TOMOS_MAX_RSS_MB,
                     "active_jobs": active_jobs, "server_instance_id": SERVER_INSTANCE_ID,
                     "started_at": SERVER_STARTED_AT}), 200
 
