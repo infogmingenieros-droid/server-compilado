@@ -63,7 +63,12 @@ Agrega estas variables al servicio (además de las que ya tenías):
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | El contenido **completo** del archivo `.json` descargado en el paso 1, pegado como una sola línea/valor |
 | `FLASK_SECRET_KEY` | Cualquier cadena larga y aleatoria, para firmar la cookie de sesión |
 | `SISTEMA_MAESTRO_KEY` | Clave privada entre Apps Script y Railway (recomendado) |
-| `MAX_CONCURRENT_JOBS` | Trabajos PDF simultáneos (por defecto `2`) |
+| `RECURSOS_RAM_MB` | RAM que puede usar el servidor. Recomendado `4096`. De aquí salen los valores automáticos de abajo |
+| `RECURSOS_CPU` | vCPU que puede usar el servidor. Recomendado `4` |
+| `MAX_CONCURRENT_JOBS` | Trabajos PDF simultáneos (automático: entre `2` y `6`) |
+| `DOWNLOAD_WORKERS` | Descargas de Drive simultáneas por trabajo (automático: entre `2` y `8`; `1` = como antes) |
+| `MAX_CONCURRENT_TOMOS` | Tomos simultáneos (automático: `2` con 4 GB o más; si no, `1`) |
+| `GUNICORN_THREADS` | Hilos para atender consultas (por defecto `8`) |
 | `UPLOAD_CHUNK_SIZE` | Tamaño de chunk en bytes para I/O de Drive (por defecto 4 MiB) |
 | `GC_COLLECT_EVERY_FILES` | GC forzado cada N PDFs (por defecto `20`) |
 | `BACKUP_ADMIN_USER` | Usuario de respaldo opcional (recomendado evitarlo si USUARIOS funciona) |
